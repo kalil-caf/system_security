@@ -38,6 +38,7 @@
 #include <android/hardware/keymaster/3.0/IHwKeymasterDevice.h>
 
 #include "defaults.h"
+#include "key_proto_handler.h"
 #include "keystore_attestation_id.h"
 #include "keystore_keymaster_enforcement.h"
 #include "keystore_utils.h"
@@ -367,6 +368,7 @@ Status KeyStoreService::lock(int32_t userId, int32_t* aidl_return) {
         return Status::ok();
     }
 
+    enforcement_policy.set_device_locked(true, userId);
     mKeyStore->lock(userId);
     *aidl_return = static_cast<int32_t>(ResponseCode::NO_ERROR);
     return Status::ok();
@@ -395,6 +397,7 @@ Status KeyStoreService::unlock(int32_t userId, const String16& pw, int32_t* aidl
         return Status::ok();
     }
 
+    enforcement_policy.set_device_locked(false, userId);
     const String8 password8(pw);
     // read master key, decrypt with password, initialize mMasterKey*.
     *aidl_return = static_cast<int32_t>(mKeyStore->readMasterKey(password8, userId));
@@ -550,8 +553,11 @@ Status KeyStoreService::sign(const String16& name, const ::std::vector<uint8_t>&
     hidl_vec<uint8_t> legacy_out;
     KeyStoreServiceReturnCode res =
         doLegacySignVerify(name, data, &legacy_out, hidl_vec<uint8_t>(), KeyPurpose::SIGN);
+    if (!res.isOk()) {
+        return Status::fromServiceSpecificError((res));
+    }
     *out = legacy_out;
-    return Status::fromServiceSpecificError((res));
+    return Status::ok();
 }
 
 Status KeyStoreService::verify(const String16& name, const ::std::vector<uint8_t>& data,
@@ -817,6 +823,7 @@ KeyStoreService::generateKey(const String16& name, const KeymasterArguments& par
     }
     if (!error.isOk()) {
         ALOGE("Failed to generate key -> falling back to software keymaster");
+        uploadKeyCharacteristicsAsProto(params.getParameters(), false /* wasCreationSuccessful */);
         securityLevel = SecurityLevel::SOFTWARE;
 
         // No fall back for 3DES
@@ -842,6 +849,16 @@ KeyStoreService::generateKey(const String16& name, const KeymasterArguments& par
             *aidl_return = static_cast<int32_t>(error);
             return Status::ok();
         }
+    } else {
+        uploadKeyCharacteristicsAsProto(params.getParameters(), true /* wasCreationSuccessful */);
+    }
+
+    if (!containsTag(params.getParameters(), Tag::USER_ID)) {
+        // Most Java processes don't have access to this tag
+        KeyParameter user_id;
+        user_id.tag = Tag::USER_ID;
+        user_id.f.integer = mActiveUserId;
+        keyCharacteristics.push_back(user_id);
     }
 
     // Write the characteristics:
@@ -1040,6 +1057,7 @@ KeyStoreService::importKey(const String16& name, const KeymasterArguments& param
     // now check error from callback
     if (!error.isOk()) {
         ALOGE("Failed to import key -> falling back to software keymaster");
+        uploadKeyCharacteristicsAsProto(params.getParameters(), false /* wasCreationSuccessful */);
         securityLevel = SecurityLevel::SOFTWARE;
 
         // No fall back for 3DES
@@ -1068,12 +1086,22 @@ KeyStoreService::importKey(const String16& name, const KeymasterArguments& param
             *aidl_return = static_cast<int32_t>(error);
             return Status::ok();
         }
+    } else {
+        uploadKeyCharacteristicsAsProto(params.getParameters(), true /* wasCreationSuccessful */);
     }
 
     // Write the characteristics:
     String8 cFilename(mKeyStore->getKeyNameForUidWithDir(name8, uid, ::TYPE_KEY_CHARACTERISTICS));
 
     AuthorizationSet opParams = params.getParameters();
+    if (!containsTag(params.getParameters(), Tag::USER_ID)) {
+        // Most Java processes don't have access to this tag
+        KeyParameter user_id;
+        user_id.tag = Tag::USER_ID;
+        user_id.f.integer = mActiveUserId;
+        opParams.push_back(user_id);
+    }
+
     std::stringstream kcStream;
     opParams.Serialize(&kcStream);
     if (kcStream.bad()) {
@@ -1317,8 +1345,9 @@ Status KeyStoreService::begin(const sp<IBinder>& appToken, const String16& name,
 
     // Note: The operation map takes possession of the contents of "characteristics".
     // It is safe to use characteristics after the following line but it will be empty.
-    sp<IBinder> operationToken = mOperationMap.addOperation(
-        result->handle, keyid, keyPurpose, dev, appToken, std::move(characteristics), pruneable);
+    sp<IBinder> operationToken =
+        mOperationMap.addOperation(result->handle, keyid, keyPurpose, dev, appToken,
+                                   std::move(characteristics), params.getParameters(), pruneable);
     assert(characteristics.hardwareEnforced.size() == 0);
     assert(characteristics.softwareEnforced.size() == 0);
     result->token = operationToken;
@@ -1384,7 +1413,6 @@ Status KeyStoreService::update(const sp<IBinder>& token, const KeymasterArgument
     if (!result->resultCode.isOk()) return Status::ok();
 
     std::vector<KeyParameter> inParams = params.getParameters();
-    appendConfirmationTokenIfNeeded(op.characteristics, &inParams);
 
     auto hidlCb = [&](ErrorCode ret, uint32_t inputConsumed,
                       const hidl_vec<KeyParameter>& outParams,
@@ -1458,20 +1486,23 @@ Status KeyStoreService::finish(const sp<IBinder>& token, const KeymasterArgument
         op.device->finish(op.handle, inParams,
                           ::std::vector<uint8_t>() /* TODO(swillden): wire up input to finish() */,
                           signature, authToken, VerificationToken(), hidlCb));
-    // removeOperation() will free the memory 'op' used, so the order is important
-    mAuthTokenTable.MarkCompleted(op.handle);
-    mOperationMap.removeOperation(token);
 
+    bool wasOpSuccessful = true;
     // just a reminder: on success result->resultCode was set in the callback. So we only overwrite
     // it if there was a communication error indicated by the ErrorCode.
     if (!rc.isOk()) {
         result->resultCode = rc;
+        wasOpSuccessful = false;
     }
+
+    // removeOperation() will free the memory 'op' used, so the order is important
+    mAuthTokenTable.MarkCompleted(op.handle);
+    mOperationMap.removeOperation(token, wasOpSuccessful);
     return Status::ok();
 }
 
 Status KeyStoreService::abort(const sp<IBinder>& token, int32_t* aidl_return) {
-    auto getOpResult = mOperationMap.removeOperation(token);
+    auto getOpResult = mOperationMap.removeOperation(token, false /* wasOpSuccessful */);
     if (!getOpResult.isOk()) {
         *aidl_return = static_cast<int32_t>(ErrorCode::INVALID_OPERATION_HANDLE);
         return Status::ok();
@@ -2224,6 +2255,17 @@ KeyStoreServiceReturnCode KeyStoreService::upgradeKeyBlob(const String16& name, 
     }
 
     return error;
+}
+
+Status KeyStoreService::onKeyguardVisibilityChanged(bool isShowing, int32_t userId,
+                                                    int32_t* aidl_return) {
+    enforcement_policy.set_device_locked(isShowing, userId);
+    if (!isShowing) {
+        mActiveUserId = userId;
+    }
+    *aidl_return = static_cast<int32_t>(ResponseCode::NO_ERROR);
+
+    return Status::ok();
 }
 
 }  // namespace keystore
