@@ -64,6 +64,8 @@ using ConfirmationResponseCode = android::hardware::confirmationui::V1_0::Respon
 constexpr size_t kMaxOperations = 15;
 constexpr double kIdRotationPeriod = 30 * 24 * 60 * 60; /* Thirty days, in seconds */
 const char* kTimestampFilePath = "timestamp";
+const int ID_ATTESTATION_REQUEST_GENERIC_INFO = 1 << 0;
+const int ID_ATTESTATION_REQUEST_UNIQUE_DEVICE_ID = 1 << 1;
 
 struct BIGNUM_Delete {
     void operator()(BIGNUM* p) const { BN_free(p); }
@@ -1343,6 +1345,24 @@ Status KeyStoreService::begin(const sp<IBinder>& appToken, const String16& name,
         return Status::ok();
     }
 
+    VerificationToken verificationToken;
+    if (authResult.isOk() && authToken.mac.size() &&
+        dev->halVersion().securityLevel == SecurityLevel::STRONGBOX) {
+        // This operation needs an auth token, but the device is a STRONGBOX, so it can't check the
+        // timestamp in the auth token.  Get a VerificationToken from the TEE, which will be passed
+        // to update() and begin().
+        rc = KS_HANDLE_HIDL_ERROR(mKeyStore->getDevice(SecurityLevel::TRUSTED_ENVIRONMENT)
+                                      ->verifyAuthorization(result->handle,
+                                                            {} /* parametersToVerify */, authToken,
+                                                            [&](auto error, const auto& token) {
+                                                                result->resultCode = error;
+                                                                verificationToken = token;
+                                                            }));
+
+        if (rc != ErrorCode::OK) result->resultCode = rc;
+        if (result->resultCode != ErrorCode::OK) return Status::ok();
+    }
+
     // Note: The operation map takes possession of the contents of "characteristics".
     // It is safe to use characteristics after the following line but it will be empty.
     sp<IBinder> operationToken =
@@ -1353,6 +1373,7 @@ Status KeyStoreService::begin(const sp<IBinder>& appToken, const String16& name,
     result->token = operationToken;
 
     mOperationMap.setOperationAuthToken(operationToken, std::move(authToken));
+    mOperationMap.setOperationVerificationToken(operationToken, std::move(verificationToken));
 
     // Return the authentication lookup result. If this is a per operation
     // auth'd key then the resultCode will be ::OP_AUTH_NEEDED and the
@@ -1426,7 +1447,7 @@ Status KeyStoreService::update(const sp<IBinder>& token, const KeymasterArgument
     };
 
     KeyStoreServiceReturnCode rc = KS_HANDLE_HIDL_ERROR(
-        op.device->update(op.handle, inParams, data, authToken, VerificationToken(), hidlCb));
+        op.device->update(op.handle, inParams, data, authToken, op.verificationToken, hidlCb));
 
     // just a reminder: on success result->resultCode was set in the callback. So we only overwrite
     // it if there was a communication error indicated by the ErrorCode.
@@ -1485,7 +1506,7 @@ Status KeyStoreService::finish(const sp<IBinder>& token, const KeymasterArgument
     KeyStoreServiceReturnCode rc = KS_HANDLE_HIDL_ERROR(
         op.device->finish(op.handle, inParams,
                           ::std::vector<uint8_t>() /* TODO(swillden): wire up input to finish() */,
-                          signature, authToken, VerificationToken(), hidlCb));
+                          signature, authToken, op.verificationToken, hidlCb));
 
     bool wasOpSuccessful = true;
     // just a reminder: on success result->resultCode was set in the callback. So we only overwrite
@@ -1551,24 +1572,28 @@ Status KeyStoreService::addAuthToken(const ::std::vector<uint8_t>& authTokenAsVe
     return Status::ok();
 }
 
-bool isDeviceIdAttestationRequested(const KeymasterArguments& params) {
+int isDeviceIdAttestationRequested(const KeymasterArguments& params) {
     const hardware::hidl_vec<KeyParameter> paramsVec = params.getParameters();
+    int result = 0;
     for (size_t i = 0; i < paramsVec.size(); ++i) {
         switch (paramsVec[i].tag) {
         case Tag::ATTESTATION_ID_BRAND:
         case Tag::ATTESTATION_ID_DEVICE:
-        case Tag::ATTESTATION_ID_IMEI:
         case Tag::ATTESTATION_ID_MANUFACTURER:
-        case Tag::ATTESTATION_ID_MEID:
         case Tag::ATTESTATION_ID_MODEL:
         case Tag::ATTESTATION_ID_PRODUCT:
-        case Tag::ATTESTATION_ID_SERIAL:
-            return true;
-        default:
+            result |= ID_ATTESTATION_REQUEST_GENERIC_INFO;
             break;
+        case Tag::ATTESTATION_ID_IMEI:
+        case Tag::ATTESTATION_ID_MEID:
+        case Tag::ATTESTATION_ID_SERIAL:
+            result |= ID_ATTESTATION_REQUEST_UNIQUE_DEVICE_ID;
+            break;
+        default:
+            continue;
         }
     }
-    return false;
+    return result;
 }
 
 Status KeyStoreService::attestKey(const String16& name, const KeymasterArguments& params,
@@ -1582,9 +1607,15 @@ Status KeyStoreService::attestKey(const String16& name, const KeymasterArguments
 
     uid_t callingUid = IPCThreadState::self()->getCallingUid();
 
-    if (isDeviceIdAttestationRequested(params) && (callingUid != AID_SYSTEM)) {
-        // Only the system context may request Device ID attestation combined with key attestation.
-        // Otherwise, There is a dedicated attestDeviceIds() method for device ID attestation.
+    int needsIdAttestation = isDeviceIdAttestationRequested(params);
+    bool needsUniqueIdAttestation = needsIdAttestation & ID_ATTESTATION_REQUEST_UNIQUE_DEVICE_ID;
+    bool isPrimaryUserSystemUid = (callingUid == AID_SYSTEM);
+    bool isSomeUserSystemUid = (get_app_id(callingUid) == AID_SYSTEM);
+    // Allow system context from any user to request attestation with basic device information,
+    // while only allow system context from user 0 (device owner) to request attestation with
+    // unique device ID.
+    if ((needsIdAttestation && !isSomeUserSystemUid) ||
+        (needsUniqueIdAttestation && !isPrimaryUserSystemUid)) {
         *aidl_return = static_cast<int32_t>(KeyStoreServiceReturnCode(ErrorCode::INVALID_ARGUMENT));
         return Status::ok();
     }
